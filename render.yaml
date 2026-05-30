@@ -13,7 +13,7 @@ services:
       - key: SCAN_INTERVAL_SECONDS
         value: "20"
       - key: INCLUDE_SPOT_WINNERS
-        value: "true"
+        value: "false"
       - key: BASE_URL
         value: "https://fapi.binance.com"
       - key: WS_URL

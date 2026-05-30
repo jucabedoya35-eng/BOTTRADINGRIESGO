@@ -20,6 +20,7 @@ import json
 import os
 import threading
 import time
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import floor
@@ -43,9 +44,10 @@ API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 MIN_GAIN_TO_SHOW = float(os.getenv("MIN_GAIN_TO_SHOW", "0"))
 SPOT_BASE_URL = os.getenv("SPOT_BASE_URL", "https://api.binance.com")
-INCLUDE_SPOT_WINNERS = os.getenv("INCLUDE_SPOT_WINNERS", "true").lower() == "true"
+INCLUDE_SPOT_WINNERS = os.getenv("INCLUDE_SPOT_WINNERS", "false").lower() == "true"
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
 LEVERAGE = int(os.getenv("LEVERAGE", "1"))
+STATE_FILE = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "bottradingriesgo_state.json"))
 
 ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
@@ -270,13 +272,15 @@ class TradingBot:
         self.scan_count = 0
         self.websocket_messages = 0
         self.exchange_symbols_count = 0
+        self.started_at = time.time()
+        self.state_file = STATE_FILE
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
 
     def log(self, message: str) -> None:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         line = f"{stamp} | {message}"
-        print(line)
+        print(line, flush=True)
         with self.lock:
             self.events = [line, *self.events[:99]]
 
@@ -354,7 +358,9 @@ class TradingBot:
                     self.log(f"Advertencia de datos: {self.client.last_warning}")
                 top_text = f"{winners[0]['symbol']} {winners[0]['change']:.2f}% ({winners[0].get('market', 'futures')})" if winners else "sin ganadores"
                 self.log(f"Escaneo #{self.scan_count}: {len(winners)} símbolos mostrados, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
+                self.persist_state()
                 await self._apply_strategy(tradable_winners)
+                self.persist_state()
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"Error en escaneo: {exc}")
@@ -391,6 +397,7 @@ class TradingBot:
         with self.lock:
             self.positions[symbol].fills.append(fill)
         self.log(f"SHORT {symbol}: nivel {level:.0f}% activado con {notional:.2f} USDT, qty={qty}, precio={price}, cambio={change:.2f}%")
+        self.persist_state()
 
     async def _maybe_take_profit(self, symbol: str, price: float) -> None:
         with self.lock:
@@ -422,51 +429,94 @@ class TradingBot:
                 })
                 self.closed_trades = self.closed_trades[:100]
         self.log(f"CIERRE {symbol}: PnL={pnl:.4f} USDT, objetivo={target:.4f}, precio cierre={price}")
+        self.persist_state()
+
+    def _current_snapshot_unlocked(self) -> dict:
+        open_positions = []
+        total_unrealized = 0.0
+        total_notional = 0.0
+        for symbol, position in self.positions.items():
+            price = self.prices.get(symbol, 0.0)
+            pnl = position.unrealized_pnl(price)
+            total_unrealized += pnl
+            total_notional += position.notional
+            open_positions.append({
+                "symbol": symbol,
+                "mark_price": price,
+                "change": self.changes.get(symbol, 0.0),
+                "avg_entry": position.avg_entry,
+                "qty": position.qty,
+                "notional": position.notional,
+                "target": position.notional * TAKE_PROFIT_FRACTION,
+                "unrealized_pnl": pnl,
+                "fills": [fill.__dict__ for fill in position.fills],
+            })
+        return {
+            "mode": "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
+            "running": self.running,
+            "thread_alive": bool(self.thread and self.thread.is_alive()),
+            "started_at": self.started_at,
+            "uptime_seconds": round(time.time() - self.started_at, 1),
+            "last_scan_at": self.last_scan_at,
+            "last_scan_text": datetime.fromtimestamp(self.last_scan_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if self.last_scan_at else "pendiente",
+            "last_error": self.last_error,
+            "last_startup_error": self.last_startup_error,
+            "last_data_warning": self.last_data_warning,
+            "scan_count": self.scan_count,
+            "websocket_messages": self.websocket_messages,
+            "exchange_symbols_count": self.exchange_symbols_count,
+            "min_gain_to_show": MIN_GAIN_TO_SHOW,
+            "include_spot_winners": INCLUDE_SPOT_WINNERS,
+            "entry_levels": ENTRY_LEVELS,
+            "entry_notionals": ENTRY_NOTIONALS,
+            "take_profit_fraction": TAKE_PROFIT_FRACTION,
+            "total_unrealized": total_unrealized,
+            "total_notional": total_notional,
+            "winners": list(self.winners[:30]),
+            "positions": open_positions,
+            "closed_trades": list(self.closed_trades[:30]),
+            "events": list(self.events),
+            "state_source": "memory",
+            "state_file": self.state_file,
+        }
+
+    def _load_persisted_snapshot(self) -> Optional[dict]:
+        try:
+            if not os.path.exists(self.state_file):
+                return None
+            with open(self.state_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return None
+            data["state_source"] = "persisted"
+            return data
+        except Exception as exc:
+            self.last_error = f"No pude leer estado persistido: {exc}"
+            return None
+
+    def persist_state(self) -> None:
+        with self.lock:
+            data = self._current_snapshot_unlocked()
+        # Evita reemplazar un estado útil por un arranque vacío.
+        if data["scan_count"] <= 0 and not data["positions"] and not data["winners"]:
+            return
+        tmp_path = f"{self.state_file}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False)
+            os.replace(tmp_path, self.state_file)
+        except Exception as exc:
+            self.last_error = f"No pude persistir estado: {exc}"
 
     def snapshot(self) -> dict:
         with self.lock:
-            open_positions = []
-            total_unrealized = 0.0
-            total_notional = 0.0
-            for symbol, position in self.positions.items():
-                price = self.prices.get(symbol, 0.0)
-                pnl = position.unrealized_pnl(price)
-                total_unrealized += pnl
-                total_notional += position.notional
-                open_positions.append({
-                    "symbol": symbol,
-                    "mark_price": price,
-                    "change": self.changes.get(symbol, 0.0),
-                    "avg_entry": position.avg_entry,
-                    "qty": position.qty,
-                    "notional": position.notional,
-                    "target": position.notional * TAKE_PROFIT_FRACTION,
-                    "unrealized_pnl": pnl,
-                    "fills": [fill.__dict__ for fill in position.fills],
-                })
-            return {
-                "mode": "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
-                "running": self.running,
-                "last_scan_at": self.last_scan_at,
-                "last_scan_text": datetime.fromtimestamp(self.last_scan_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if self.last_scan_at else "pendiente",
-                "last_error": self.last_error,
-                "last_startup_error": self.last_startup_error,
-                "last_data_warning": self.last_data_warning,
-                "scan_count": self.scan_count,
-                "websocket_messages": self.websocket_messages,
-                "exchange_symbols_count": self.exchange_symbols_count,
-                "min_gain_to_show": MIN_GAIN_TO_SHOW,
-                "include_spot_winners": INCLUDE_SPOT_WINNERS,
-                "entry_levels": ENTRY_LEVELS,
-                "entry_notionals": ENTRY_NOTIONALS,
-                "take_profit_fraction": TAKE_PROFIT_FRACTION,
-                "total_unrealized": total_unrealized,
-                "total_notional": total_notional,
-                "winners": list(self.winners[:30]),
-                "positions": open_positions,
-                "closed_trades": list(self.closed_trades[:30]),
-                "events": list(self.events),
-            }
+            data = self._current_snapshot_unlocked()
+        persisted = self._load_persisted_snapshot()
+        if persisted and persisted.get("scan_count", 0) > data.get("scan_count", 0):
+            return persisted
+        if persisted and not data.get("positions") and persisted.get("positions"):
+            return persisted
+        return data
 
 
 bot = TradingBot()
@@ -514,6 +564,8 @@ HTML = """
     <div class="card"><div class="label">Escaneos</div><div id="scanCount" class="value">{{ snapshot.scan_count }}</div></div>
     <div class="card"><div class="label">Contratos futures cargados</div><div id="contracts" class="value">{{ snapshot.exchange_symbols_count }}</div></div>
     <div class="card"><div class="label">Mensajes WebSocket</div><div id="wsMessages" class="value">{{ snapshot.websocket_messages }}</div></div>
+    <div class="card"><div class="label">Fuente estado</div><div id="stateSource" class="value" style="font-size:16px">{{ snapshot.state_source }}</div></div>
+    <div class="card"><div class="label">Thread bot</div><div id="threadAlive" class="value" style="font-size:16px">{{ 'vivo' if snapshot.thread_alive else 'muerto' }}</div></div>
   </section>
 
   <section id="errorBox" class="card" style="display:{{ 'block' if (snapshot.last_error or snapshot.last_data_warning or snapshot.last_startup_error) else 'none' }}">
@@ -590,6 +642,8 @@ function renderStatus(data) {
   document.getElementById('scanCount').textContent = num(data.scan_count);
   document.getElementById('contracts').textContent = num(data.exchange_symbols_count);
   document.getElementById('wsMessages').textContent = num(data.websocket_messages);
+  document.getElementById('stateSource').textContent = data.state_source || 'memory';
+  document.getElementById('threadAlive').textContent = data.thread_alive ? 'vivo' : 'muerto';
   const errorText = data.last_error || data.last_data_warning || data.last_startup_error || '';
   document.getElementById('errorBox').style.display = errorText ? 'block' : 'none';
   document.getElementById('lastError').textContent = errorText;
