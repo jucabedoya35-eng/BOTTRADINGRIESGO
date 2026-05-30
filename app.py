@@ -539,35 +539,77 @@ HTML = """
     <h2>Eventos</h2>
     <pre id="events"></pre>
   </section>
+
+  <section>
+    <h2>Estado API crudo</h2>
+    <pre id="rawStatus"></pre>
+  </section>
 </main>
+<script id="initial-status" type="application/json">{{ initial_status_json | safe }}</script>
 <script>
-function money(value) { return Number(value || 0).toFixed(4) + ' USDT'; }
-function pct(value) { return Number(value || 0).toFixed(2) + '%'; }
-function cls(value) { return Number(value || 0) >= 0 ? 'positive' : 'negative'; }
-async function refresh() {
-  const response = await fetch('/api/status');
-  const data = await response.json();
-  document.getElementById('mode').textContent = data.mode;
+function num(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+function fixed(value, decimals = 8) { return num(value).toFixed(decimals); }
+function money(value) { return fixed(value, 4) + ' USDT'; }
+function pct(value) { return fixed(value, 2) + '%'; }
+function cls(value) { return num(value) >= 0 ? 'positive' : 'negative'; }
+function rowsOrFallback(rows, fallback) { return rows.length ? rows.join('') : fallback; }
+function renderStatus(data) {
+  data = data || {};
+  const positions = Array.isArray(data.positions) ? data.positions : [];
+  const winners = Array.isArray(data.winners) ? data.winners : [];
+  const closedTrades = Array.isArray(data.closed_trades) ? data.closed_trades : [];
+  const events = Array.isArray(data.events) ? data.events : [];
+
+  document.getElementById('mode').textContent = data.mode || 'sin datos';
   document.getElementById('pnl').textContent = money(data.total_unrealized);
   document.getElementById('pnl').className = 'value ' + cls(data.total_unrealized);
   document.getElementById('notional').textContent = money(data.total_notional);
-  document.getElementById('scan').textContent = data.last_scan_text;
-  document.getElementById('scanCount').textContent = data.scan_count;
-  document.getElementById('contracts').textContent = data.exchange_symbols_count;
-  document.getElementById('wsMessages').textContent = data.websocket_messages;
+  document.getElementById('scan').textContent = data.last_scan_text || 'pendiente';
+  document.getElementById('scanCount').textContent = num(data.scan_count);
+  document.getElementById('contracts').textContent = num(data.exchange_symbols_count);
+  document.getElementById('wsMessages').textContent = num(data.websocket_messages);
   const errorText = data.last_error || data.last_data_warning || data.last_startup_error || '';
   document.getElementById('errorBox').style.display = errorText ? 'block' : 'none';
   document.getElementById('lastError').textContent = errorText;
-  document.getElementById('positions').innerHTML = data.positions.map(p => `
-    <tr><td>${p.symbol}</td><td>${pct(p.change)}</td><td>${p.avg_entry.toFixed(8)}</td><td>${p.mark_price.toFixed(8)}</td><td>${money(p.notional)}</td><td>${money(p.target)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td>${p.fills.map(f => '<span class="pill">+' + f.level + '% / ' + f.notional + '</span>').join(' ')}</td></tr>
-  `).join('') || '<tr><td colspan="8">Sin posiciones abiertas</td></tr>';
-  document.getElementById('winners').innerHTML = data.winners.map(w => `
-    <tr><td>${w.symbol}</td><td>${w.market || 'futures'}</td><td>${w.can_short ? 'sí' : 'no'}</td><td class="${cls(w.change)}">${pct(w.change)}</td><td>${Number(w.price).toFixed(8)}</td><td>${Number(w.quoteVolume).toLocaleString()}</td></tr>
-  `).join('') || '<tr><td colspan="6">No hay símbolos para mostrar todavía. Revisa el bloque de errores y eventos.</td></tr>';
-  document.getElementById('closed').innerHTML = data.closed_trades.map(t => `
-    <tr><td>${t.symbol}</td><td class="positive">${money(t.pnl)}</td><td>${money(t.target)}</td><td>${Number(t.avg_entry).toFixed(8)}</td><td>${Number(t.close_price).toFixed(8)}</td><td>${t.closed_at}</td></tr>
-  `).join('') || '<tr><td colspan="6">Sin cierres todavía</td></tr>';
-  document.getElementById('events').textContent = data.events.join('\n');
+
+  document.getElementById('positions').innerHTML = rowsOrFallback(positions.map(p => `
+    <tr><td>${p.symbol || ''}</td><td>${pct(p.change)}</td><td>${fixed(p.avg_entry)}</td><td>${fixed(p.mark_price)}</td><td>${money(p.notional)}</td><td>${money(p.target)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td>${(Array.isArray(p.fills) ? p.fills : []).map(f => '<span class="pill">+' + fixed(f.level, 0) + '% / ' + fixed(f.notional, 2) + '</span>').join(' ')}</td></tr>
+  `), '<tr><td colspan="8">Sin posiciones abiertas</td></tr>');
+
+  document.getElementById('winners').innerHTML = rowsOrFallback(winners.map(w => `
+    <tr><td>${w.symbol || ''}</td><td>${w.market || 'futures'}</td><td>${w.can_short ? 'sí' : 'no'}</td><td class="${cls(w.change)}">${pct(w.change)}</td><td>${fixed(w.price)}</td><td>${num(w.quoteVolume).toLocaleString()}</td></tr>
+  `), '<tr><td colspan="6">No hay símbolos para mostrar todavía. Revisa el bloque de errores y eventos.</td></tr>');
+
+  document.getElementById('closed').innerHTML = rowsOrFallback(closedTrades.map(t => `
+    <tr><td>${t.symbol || ''}</td><td class="positive">${money(t.pnl)}</td><td>${money(t.target)}</td><td>${fixed(t.avg_entry)}</td><td>${fixed(t.close_price)}</td><td>${t.closed_at || ''}</td></tr>
+  `), '<tr><td colspan="6">Sin cierres todavía</td></tr>');
+  document.getElementById('events').textContent = events.join('\n');
+  document.getElementById('rawStatus').textContent = JSON.stringify(data, null, 2);
+}
+function renderClientError(error) {
+  const message = 'Error de la página consultando /api/status: ' + error.message;
+  document.getElementById('errorBox').style.display = 'block';
+  document.getElementById('lastError').textContent = message;
+  document.getElementById('events').textContent = message + '\n' + document.getElementById('events').textContent;
+}
+async function refresh() {
+  try {
+    const response = await fetch('/api/status', {cache: 'no-store'});
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status);
+    }
+    renderStatus(await response.json());
+  } catch (error) {
+    renderClientError(error);
+  }
+}
+try {
+  renderStatus(JSON.parse(document.getElementById('initial-status').textContent || '{}'));
+} catch (error) {
+  renderClientError(error);
 }
 refresh();
 setInterval(refresh, 3000);
@@ -579,7 +621,10 @@ setInterval(refresh, 3000);
 
 @app.get("/")
 def index():
-    return render_template_string(HTML)
+    return render_template_string(
+        HTML,
+        initial_status_json=json.dumps(bot.snapshot(), ensure_ascii=False).replace("</", "<\\/"),
+    )
 
 
 @app.get("/api/status")
