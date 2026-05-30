@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 import websockets
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, make_response, render_template_string
 
 
 BASE_URL = os.getenv("BASE_URL", "https://fapi.binance.com")
@@ -480,6 +480,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="15">
   <title>Bot Short Ganadores Binance</title>
   <style>
     body { margin: 0; font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; }
@@ -506,43 +507,61 @@ HTML = """
 </header>
 <main>
   <section class="cards">
-    <div class="card"><div class="label">Modo</div><div id="mode" class="value warn">...</div></div>
-    <div class="card"><div class="label">PnL no realizado</div><div id="pnl" class="value">...</div></div>
-    <div class="card"><div class="label">Capital en posiciones</div><div id="notional" class="value">...</div></div>
-    <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value" style="font-size:16px">...</div></div>
-    <div class="card"><div class="label">Escaneos</div><div id="scanCount" class="value">0</div></div>
-    <div class="card"><div class="label">Contratos futures cargados</div><div id="contracts" class="value">0</div></div>
-    <div class="card"><div class="label">Mensajes WebSocket</div><div id="wsMessages" class="value">0</div></div>
+    <div class="card"><div class="label">Modo</div><div id="mode" class="value warn">{{ snapshot.mode }}</div></div>
+    <div class="card"><div class="label">PnL no realizado</div><div id="pnl" class="value {{ 'positive' if snapshot.total_unrealized >= 0 else 'negative' }}">{{ "%.4f"|format(snapshot.total_unrealized) }} USDT</div></div>
+    <div class="card"><div class="label">Capital en posiciones</div><div id="notional" class="value">{{ "%.4f"|format(snapshot.total_notional) }} USDT</div></div>
+    <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value" style="font-size:16px">{{ snapshot.last_scan_text }}</div></div>
+    <div class="card"><div class="label">Escaneos</div><div id="scanCount" class="value">{{ snapshot.scan_count }}</div></div>
+    <div class="card"><div class="label">Contratos futures cargados</div><div id="contracts" class="value">{{ snapshot.exchange_symbols_count }}</div></div>
+    <div class="card"><div class="label">Mensajes WebSocket</div><div id="wsMessages" class="value">{{ snapshot.websocket_messages }}</div></div>
   </section>
 
-  <section id="errorBox" class="card" style="display:none">
+  <section id="errorBox" class="card" style="display:{{ 'block' if (snapshot.last_error or snapshot.last_data_warning or snapshot.last_startup_error) else 'none' }}">
     <div class="label">Último error / diagnóstico</div>
-    <div id="lastError" class="value negative" style="font-size:16px; word-break: break-word"></div>
+    <div id="lastError" class="value negative" style="font-size:16px; word-break: break-word">{{ snapshot.last_error or snapshot.last_data_warning or snapshot.last_startup_error }}</div>
   </section>
 
   <section>
     <h2>Posiciones abiertas</h2>
-    <table><thead><tr><th>Símbolo</th><th>Cambio 24h</th><th>Entrada media</th><th>Precio</th><th>Notional</th><th>Objetivo</th><th>PnL</th><th>Tramos</th></tr></thead><tbody id="positions"></tbody></table>
+    <table><thead><tr><th>Símbolo</th><th>Cambio 24h</th><th>Entrada media</th><th>Precio</th><th>Notional</th><th>Objetivo</th><th>PnL</th><th>Tramos</th></tr></thead><tbody id="positions">
+      {% for p in snapshot.positions %}
+      <tr><td>{{ p.symbol }}</td><td>{{ "%.2f"|format(p.change) }}%</td><td>{{ "%.8f"|format(p.avg_entry) }}</td><td>{{ "%.8f"|format(p.mark_price) }}</td><td>{{ "%.4f"|format(p.notional) }} USDT</td><td>{{ "%.4f"|format(p.target) }} USDT</td><td class="{{ 'positive' if p.unrealized_pnl >= 0 else 'negative' }}">{{ "%.4f"|format(p.unrealized_pnl) }} USDT</td><td>{% for f in p.fills %}<span class="pill">+{{ "%.0f"|format(f.level) }}% / {{ "%.2f"|format(f.notional) }}</span> {% endfor %}</td></tr>
+      {% else %}
+      <tr><td colspan="8">Sin posiciones abiertas</td></tr>
+      {% endfor %}
+    </tbody></table>
   </section>
 
   <section>
     <h2>Ganadores detectados</h2>
-    <table><thead><tr><th>Símbolo</th><th>Mercado</th><th>Short</th><th>Cambio 24h</th><th>Precio</th><th>Volumen quote</th></tr></thead><tbody id="winners"></tbody></table>
+    <table><thead><tr><th>Símbolo</th><th>Mercado</th><th>Short</th><th>Cambio 24h</th><th>Precio</th><th>Volumen quote</th></tr></thead><tbody id="winners">
+      {% for w in snapshot.winners %}
+      <tr><td>{{ w.symbol }}</td><td>{{ w.market or 'futures' }}</td><td>{{ 'sí' if w.can_short else 'no' }}</td><td class="{{ 'positive' if w.change >= 0 else 'negative' }}">{{ "%.2f"|format(w.change) }}%</td><td>{{ "%.8f"|format(w.price) }}</td><td>{{ "%.2f"|format(w.quoteVolume) }}</td></tr>
+      {% else %}
+      <tr><td colspan="6">No hay símbolos para mostrar todavía. Revisa el bloque de errores y eventos.</td></tr>
+      {% endfor %}
+    </tbody></table>
   </section>
 
   <section>
     <h2>Operaciones cerradas</h2>
-    <table><thead><tr><th>Símbolo</th><th>PnL</th><th>Objetivo</th><th>Entrada media</th><th>Cierre</th><th>Fecha</th></tr></thead><tbody id="closed"></tbody></table>
+    <table><thead><tr><th>Símbolo</th><th>PnL</th><th>Objetivo</th><th>Entrada media</th><th>Cierre</th><th>Fecha</th></tr></thead><tbody id="closed">
+      {% for t in snapshot.closed_trades %}
+      <tr><td>{{ t.symbol }}</td><td class="positive">{{ "%.4f"|format(t.pnl) }} USDT</td><td>{{ "%.4f"|format(t.target) }} USDT</td><td>{{ "%.8f"|format(t.avg_entry) }}</td><td>{{ "%.8f"|format(t.close_price) }}</td><td>{{ t.closed_at }}</td></tr>
+      {% else %}
+      <tr><td colspan="6">Sin cierres todavía</td></tr>
+      {% endfor %}
+    </tbody></table>
   </section>
 
   <section>
     <h2>Eventos</h2>
-    <pre id="events"></pre>
+    <pre id="events">{{ snapshot.events|join("\n") }}</pre>
   </section>
 
   <section>
     <h2>Estado API crudo</h2>
-    <pre id="rawStatus"></pre>
+    <pre id="rawStatus">{{ initial_status_json }}</pre>
   </section>
 </main>
 <script id="initial-status" type="application/json">{{ initial_status_json | safe }}</script>
@@ -621,15 +640,22 @@ setInterval(refresh, 3000);
 
 @app.get("/")
 def index():
-    return render_template_string(
+    snapshot = bot.snapshot()
+    initial_status_json = json.dumps(snapshot, ensure_ascii=False).replace("</", "<\\/")
+    response = make_response(render_template_string(
         HTML,
-        initial_status_json=json.dumps(bot.snapshot(), ensure_ascii=False).replace("</", "<\\/"),
-    )
+        snapshot=snapshot,
+        initial_status_json=initial_status_json,
+    ))
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.get("/api/status")
 def status():
-    return jsonify(bot.snapshot())
+    response = jsonify(bot.snapshot())
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.get("/health")
