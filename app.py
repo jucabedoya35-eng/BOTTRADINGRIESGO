@@ -4,15 +4,15 @@ Bot web para shortear ganadores de Binance Futures.
 ARQUITECTURA CORRECTA:
 ════════════════════════════════════════════════════════════════════════════
  1. REST cada 60 s  → /fapi/v1/ticker/24hr
-      Solo para descubrir los TOP 30 símbolos ganadores por cambio 24h.
+      Solo para descubrir los TOP 20 símbolos ganadores por cambio 24h.
       Una sola llamada, ~5 tokens REST. Guarda symbol + change + precio inicial.
 
- 2. SymbolWebSocketPriceCache (WS.py)  → markPrice@1s de los 30 símbolos
+ 2. SymbolWebSocketPriceCache (WS.py)  → markPrice@1s de los 20 símbolos
       Precio en tiempo real para: evaluar TP de posiciones abiertas y
       mostrar precios actualizados en la tabla de ganadores y posiciones.
       Se re-suscribe cuando la lista de 30 símbolos cambia.
 
- 3. KlineWebSocketCache (KlineWebSocketCache_v4.py)  → klines 1m de los 30
+ 3. KlineWebSocketCache (KlineWebSocketCache_v4.py)  → klines 1m de los 20
       Velas en tiempo real para verificar condiciones técnicas de entrada
       antes de abrir un tramo short.
       Se re-inicia cuando la lista cambia (backfill rápido).
@@ -76,7 +76,7 @@ LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 
 # Cuántos ganadores seguir (top N por cambio 24h)
-TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "30"))
+TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "20"))
 # Cada cuántos segundos refrescar la lista de ganadores por REST
 WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "60"))
 # Cada cuántos segundos corre el scanner de entrada
@@ -354,7 +354,7 @@ class TradingBot:
         pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
             pairs             = pairs,
-            max_candles       = 10,
+            max_candles       = 3,
             include_open_candle = True,
             backfill_on_start = True,
             streams_per_connection = 30,
