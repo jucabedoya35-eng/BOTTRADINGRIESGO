@@ -4,17 +4,64 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    # ── Gunicorn con gthread ──────────────────────────────────────────────────
+    # worker-class gthread  → threads reales; el SSE ocupa uno sin bloquear
+    #                         a los demás (sync workers mueren a los 30 s).
+    # workers 1             → plan starter tiene 512 MB RAM; 1 proceso es
+    #                         suficiente con 8 threads (7 SSE + 1 API).
+    # timeout 0             → deshabilita el watchdog de inactividad de
+    #                         gunicorn (SSE es "silencioso" entre pings).
+    # keepalive 65          → keep-alive TCP > ping SSE de 25 s que envía app.py.
+    startCommand: >-
+      gunicorn app:app
+      --bind 0.0.0.0:$PORT
+      --worker-class gthread
+      --workers 1
+      --threads 8
+      --timeout 0
+      --keepalive 65
+      --log-level info
+
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.13"
+
+      # ── Modo de operación ───────────────────────────────────────────────────
       - key: PAPER_MODE
-        value: "true"
-      - key: SCAN_INTERVAL_SECONDS
-        value: "60"
-      - key: INCLUDE_SPOT_WINNERS
-        value: "false"
+        value: "true"         # cambiar a "false" solo con API keys reales
+      - key: LIVE_TRADING
+        value: "false"        # "true" activa órdenes reales (requiere keys)
+      - key: LEVERAGE
+        value: "1"
+
+      # ── API Binance (solo necesarias para LIVE_TRADING=true) ───────────────
+      # - key: BINANCE_API_KEY
+      #   sync: false         # añadir como secret en Render
+      # - key: BINANCE_API_SECRET
+      #   sync: false
+
+      # ── Endpoints REST ─────────────────────────────────────────────────────
       - key: BASE_URL
         value: "https://fapi.binance.com"
-      - key: WS_URL
-        value: "wss://fstream.binance.com/ws/!ticker@arr"
+      - key: QUOTE_ASSET
+        value: "USDT"
+
+      # ── Estrategia ─────────────────────────────────────────────────────────
+      - key: TOP_WINNERS
+        value: "30"           # cuántos símbolos ganadores seguir por WS
+      - key: MIN_GAIN_TO_SHOW
+        value: "0"            # cambio 24h mínimo para aparecer en tabla
+
+      # ── Tiempos (en segundos) ───────────────────────────────────────────────
+      - key: WINNERS_REFRESH_SECS
+        value: "60"           # cada cuánto se llama REST para renovar los 30
+      - key: SCAN_INTERVAL_SECS
+        value: "10"           # cada cuánto el scanner evalúa entradas
+
+      # ── Niveles de entrada y notionals ─────────────────────────────────────
+      - key: ENTRY_LEVELS
+        value: "50,75,100,150,200,250"
+      - key: ENTRY_NOTIONALS
+        value: "5,5,10,20,40,80"
+      - key: TAKE_PROFIT_FRACTION
+        value: "0.14284"
