@@ -354,7 +354,7 @@ class TradingBot:
         pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
             pairs             = pairs,
-            max_candles       = 200,
+            max_candles       = 10,
             include_open_candle = True,
             backfill_on_start = True,
             streams_per_connection = 30,
