@@ -17,17 +17,10 @@ ARQUITECTURA DE DATOS:
     self.changes y self.quote_volumes en tiempo real. No consume peso REST.
     El PnL no realizado de posiciones abiertas se actualiza con cada mensaje.
 
-- Respaldo REST — /fapi/v1/ticker/24hr (una sola llamada periódica):
-    Se ejecuta en dos situaciones:
-      1. Arranque: si tras 15s el WS todavía no tiene datos (cold-start).
-      2. Periódicamente cada REST_FALLBACK_SECONDS (default 60s): para capturar
-         símbolos cuyo cambio 24h pudo subir repentinamente y que el cache WS
-         aún no haya propagado con suficiente ganancia visible. La respuesta REST
-         se fusiona (merge) con el cache WS: si el símbolo ya existe en el cache,
-         se actualiza SOLO si el precio REST es más reciente (distinto); si no
-         existe, se añade. Esto garantiza cobertura total sin eliminar datos WS.
-    Una sola llamada REST pesa ~40 tokens (limit=1000) de los 2400/min
-    disponibles — insignificante comparado con llamar cada 20s.
+- Fallback REST opcional — /fapi/v1/ticker/24hr:
+    Está desactivado por defecto para evitar bans 418/429. Si se habilita con
+    ENABLE_REST_FALLBACK=true, solo se usa una vez al arranque y nunca en
+    bucle periódico. La operación normal debe depender del WebSocket.
 """
 
 from __future__ import annotations
@@ -62,10 +55,10 @@ FUTURES_TICKER_WS_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
 # Cada cuántos segundos recalculamos la lista de ganadores desde el cache WS
 WINNERS_REFRESH_SECONDS = int(os.getenv("WINNERS_REFRESH_SECONDS", "60"))
-# Cada cuántos segundos se hace la llamada REST de respaldo para capturar
-# símbolos con subidas repentinas que el WS pudo no haber propagado aún.
-# También actúa como cold-start si el WS no tiene datos en los primeros 15s.
+# Fallback REST desactivado por defecto para evitar bans 418/429.
+# Si se activa manualmente, solo hace un intento de arranque y no entra en bucle.
 REST_FALLBACK_SECONDS = int(os.getenv("REST_FALLBACK_SECONDS", "60"))
+ENABLE_REST_FALLBACK = os.getenv("ENABLE_REST_FALLBACK", "false").lower() == "true"
 
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -296,11 +289,14 @@ class TradingBot:
             self.last_error = str(exc)
             self.log(f"No se pudo cargar exchangeInfo ({exc}). Continúo con filtros mínimos.")
 
-        # Tres tareas paralelas:
-        #   1. _ticker_ws       → alimenta el cache desde WS (~1s)
-        #   2. _rest_fallback_loop → merge REST periódico (cold-start + cada 60s)
-        #   3. _scanner         → aplica estrategia leyendo el cache
-        await asyncio.gather(self._ticker_ws(), self._rest_fallback_loop(), self._scanner())
+        # Dos tareas paralelas por defecto:
+        #   1. _ticker_ws → alimenta el cache desde WS (~1s)
+        #   2. _scanner   → aplica estrategia leyendo el cache
+        # El fallback REST solo se activa si ENABLE_REST_FALLBACK=true.
+        tasks = [self._ticker_ws(), self._scanner()]
+        if ENABLE_REST_FALLBACK:
+            tasks.append(self._rest_fallback_loop())
+        await asyncio.gather(*tasks)
 
     # =========================================================================
     # WEBSOCKET DE MINI-TICKERS  —  actualiza precios y cambios 24h en tiempo real
@@ -386,13 +382,8 @@ class TradingBot:
         Llama a /fapi/v1/ticker/24hr UNA sola vez y fusiona los resultados
         con el cache WS existente.
 
-        Regla de merge (sin borrar datos WS):
-          • Símbolo ya en cache WS → se sobreescribe precio, cambio y volumen
-            con los datos REST (más frescos en cambio 24h acumulado).
-          • Símbolo NUEVO (no estaba en el cache WS) → se añade al cache.
-
-        Peso de la llamada: ~40 tokens de 2400/min. Con REST_FALLBACK_SECONDS=60
-        se consume ~40 tokens/min, dejando 2360 para todo lo demás.
+        Esta ruta queda reservada para cold-start manual o diagnóstico.
+        No debe ejecutarse como polling periódico en producción.
         """
         try:
             self.log(f"REST fallback ({reason}): consultando /fapi/v1/ticker/24hr…")
@@ -435,36 +426,27 @@ class TradingBot:
 
     async def _rest_fallback_loop(self) -> None:
         """
-        Tarea de fondo que dispara _rest_fallback_merge cada REST_FALLBACK_SECONDS.
+        Fallback REST opcional.
 
-        Primera ejecución:
-          - Si el WS ya tiene datos (arranque normal): espera REST_FALLBACK_SECONDS
-            antes de la primera llamada.
-          - Si el WS NO tiene datos tras 15s (cold-start / red lenta): llama
-            inmediatamente como respaldo de arranque.
+        Por defecto no hace nada. Si ENABLE_REST_FALLBACK=true, espera hasta
+        15s para ver si el WebSocket entrega datos y, si no hay datos, hace
+        un único intento de arranque con /fapi/v1/ticker/24hr. No ejecuta
+        llamadas periódicas, para evitar el ban que estabas viendo.
         """
-        # Esperar hasta 15s al WS antes del cold-start fallback
+        if not ENABLE_REST_FALLBACK:
+            self.log("REST fallback desactivado (ENABLE_REST_FALLBACK=false)")
+            return
+
         for _ in range(30):
             if not self.running:
                 return
             with self.lock:
-                has_data = len(self.prices) > 0
-            if has_data:
-                break
+                if len(self.prices) > 0:
+                    self.log("REST fallback omitido: el WebSocket ya tiene datos")
+                    return
             await asyncio.sleep(0.5)
 
-        with self.lock:
-            has_data = len(self.prices) > 0
-
-        if not has_data:
-            await self._rest_fallback_merge(reason="cold-start")
-        else:
-            # WS ya tiene datos: primera llamada periódica tras REST_FALLBACK_SECONDS
-            await asyncio.sleep(REST_FALLBACK_SECONDS)
-
-        while self.running:
-            await self._rest_fallback_merge(reason="periodic")
-            await asyncio.sleep(REST_FALLBACK_SECONDS)
+        await self._rest_fallback_merge(reason="cold-start")
 
     # =========================================================================
     # SCANNER  —  fuente primaria: cache WS; respaldo: _rest_fallback_loop
@@ -505,7 +487,8 @@ class TradingBot:
         Ciclo principal del bot.
 
         Fuente primaria de precios/cambios: cache WS (!miniTicker@arr).
-        Fuente secundaria: merge REST periódico (_rest_fallback_loop).
+        Fuente secundaria opcional: un único fallback REST de arranque si se
+        habilita ENABLE_REST_FALLBACK=true.
 
         - Espera hasta 30s a que alguna de las dos fuentes tenga datos.
         - Recalcula ganadores cada WINNERS_REFRESH_SECONDS leyendo el cache.
@@ -754,7 +737,7 @@ HTML = """
 </head>
 <body>
 <header>
-  <h1>Bot Short de Símbolos Ganadores Binance Futures <span class="ws-badge">WebSocket-only · 0 REST polling</span></h1>
+  <h1>Bot Short de Símbolos Ganadores Binance Futures <span class="ws-badge">WebSocket-first · REST fallback desactivado</span></h1>
   <p>Abre shorts al superar +50% y agrega tramos hasta +250%. Cierra cuando el PnL llega al 50% del notional. Precios y cambios actualizados cada ~1s vía !miniTicker@arr.</p>
 </header>
 <main>
