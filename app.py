@@ -731,7 +731,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="15">
+  
   <title>Bot Short Ganadores Binance</title>
   <style>
     body { margin: 0; font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; }
@@ -754,8 +754,8 @@ HTML = """
 </head>
 <body>
 <header>
-  <h1>Bot Short de Símbolos Ganadores Binance Futures <span class="ws-badge">WebSocket-only · 0 REST polling</span></h1>
-  <p>Abre shorts al superar +50% y agrega tramos hasta +250%. Cierra cuando el PnL llega al 50% del notional. Precios y cambios actualizados cada ~1s vía !miniTicker@arr.</p>
+  <h1>Bot Short de Símbolos Ganadores Binance Futures <span class="ws-badge">Precio en vivo por WebSocket</span></h1>
+  <p>Abre shorts al superar +50% y agrega tramos hasta +250%. Cierra cuando el PnL llega al 50% del notional. La página escucha <code>!miniTicker@arr</code> para actualizar precios en tiempo real; el backend mantiene el respaldo REST solo para descubrir símbolos nuevos.</p>
 </header>
 <main>
   <section class="cards">
@@ -765,7 +765,7 @@ HTML = """
     <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value" style="font-size:16px">{{ snapshot.last_scan_text }}</div></div>
     <div class="card"><div class="label">Escaneos</div><div id="scanCount" class="value">{{ snapshot.scan_count }}</div></div>
     <div class="card"><div class="label">Contratos futures cargados</div><div id="contracts" class="value">{{ snapshot.exchange_symbols_count }}</div></div>
-    <div class="card"><div class="label">Mensajes WebSocket</div><div id="wsMessages" class="value">{{ snapshot.websocket_messages }}</div></div>
+    <div class="card"><div class="label">Mensajes WS navegador</div><div id="wsMessages" class="value">{{ snapshot.websocket_messages }}</div></div>
     <div class="card"><div class="label">Fuente estado</div><div id="stateSource" class="value" style="font-size:16px">{{ snapshot.state_source }}</div></div>
     <div class="card"><div class="label">Thread bot</div><div id="threadAlive" class="value" style="font-size:16px">{{ 'vivo' if snapshot.thread_alive else 'muerto' }}</div></div>
   </section>
@@ -820,6 +820,13 @@ HTML = """
 </main>
 <script id="initial-status" type="application/json">{{ initial_status_json | safe }}</script>
 <script>
+const PRICE_WS_URL = 'wss://fstream.binance.com/ws/!miniTicker@arr';
+let state = {};
+let priceSocket = null;
+let reconnectTimer = null;
+let reconnectDelayMs = 1000;
+let userClosedSocket = false;
+
 function num(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -829,24 +836,103 @@ function money(value) { return fixed(value, 4) + ' USDT'; }
 function pct(value) { return fixed(value, 2) + '%'; }
 function cls(value) { return num(value) >= 0 ? 'positive' : 'negative'; }
 function rowsOrFallback(rows, fallback) { return rows.length ? rows.join('') : fallback; }
-function renderStatus(data) {
-  data = data || {};
-  const positions = Array.isArray(data.positions) ? data.positions : [];
-  const winners = Array.isArray(data.winners) ? data.winners : [];
-  const closedTrades = Array.isArray(data.closed_trades) ? data.closed_trades : [];
-  const events = Array.isArray(data.events) ? data.events : [];
 
-  document.getElementById('mode').textContent = data.mode || 'sin datos';
-  document.getElementById('pnl').textContent = money(data.total_unrealized);
-  document.getElementById('pnl').className = 'value ' + cls(data.total_unrealized);
-  document.getElementById('notional').textContent = money(data.total_notional);
-  document.getElementById('scan').textContent = data.last_scan_text || 'pendiente';
-  document.getElementById('scanCount').textContent = num(data.scan_count);
-  document.getElementById('contracts').textContent = num(data.exchange_symbols_count);
-  document.getElementById('wsMessages').textContent = num(data.websocket_messages);
-  document.getElementById('stateSource').textContent = data.state_source || 'memory';
-  document.getElementById('threadAlive').textContent = data.thread_alive ? 'vivo' : 'muerto';
-  const errorText = data.last_error || data.last_data_warning || data.last_startup_error || '';
+function recomputeDerivedFields(data) {
+  const positions = Array.isArray(data.positions) ? data.positions : [];
+  let totalUnrealized = 0.0;
+  let totalNotional = 0.0;
+
+  for (const position of positions) {
+    const markPrice = num(position.mark_price);
+    const avgEntry = num(position.avg_entry);
+    const qty = num(position.qty);
+    const notional = num(position.notional);
+
+    let unrealized = 0.0;
+    if (markPrice > 0 && qty > 0) {
+      unrealized = (avgEntry - markPrice) * qty;
+    }
+
+    position.unrealized_pnl = unrealized;
+    totalUnrealized += unrealized;
+    totalNotional += notional;
+  }
+
+  data.total_unrealized = totalUnrealized;
+  data.total_notional = totalNotional;
+}
+
+function applyMiniTickerBatch(payload) {
+  if (!Array.isArray(payload) || !payload.length) return false;
+
+  const updates = new Map();
+  for (const item of payload) {
+    const symbol = item && typeof item.s === 'string' ? item.s : '';
+    if (!symbol || !symbol.endsWith('USDT')) continue;
+    const price = num(item.c);
+    const change = num(item.P);
+    const quoteVolume = num(item.q ?? item.v);
+    if (price <= 0) continue;
+    updates.set(symbol, { price, change, quoteVolume });
+  }
+  if (!updates.size) return false;
+
+  let changed = false;
+
+  if (!Array.isArray(state.positions)) state.positions = [];
+  if (!Array.isArray(state.winners)) state.winners = [];
+
+  for (const position of state.positions) {
+    const update = updates.get(position.symbol);
+    if (!update) continue;
+    position.mark_price = update.price;
+    position.change = update.change;
+    changed = true;
+  }
+
+  for (const winner of state.winners) {
+    const update = updates.get(winner.symbol);
+    if (!update) continue;
+    winner.price = update.price;
+    winner.change = update.change;
+    winner.quoteVolume = update.quoteVolume;
+    changed = true;
+  }
+
+  if (changed) {
+    state.browser_websocket_messages = num(state.browser_websocket_messages) + 1;
+    recomputeDerivedFields(state);
+  }
+
+  return changed;
+}
+
+function renderStatus(data) {
+  state = data || {};
+  if (!Array.isArray(state.positions)) state.positions = [];
+  if (!Array.isArray(state.winners)) state.winners = [];
+  if (!Array.isArray(state.closed_trades)) state.closed_trades = [];
+  if (!Array.isArray(state.events)) state.events = [];
+  if (typeof state.browser_websocket_messages !== 'number') state.browser_websocket_messages = 0;
+
+  recomputeDerivedFields(state);
+
+  const positions = state.positions;
+  const winners = state.winners;
+  const closedTrades = state.closed_trades;
+  const events = state.events;
+
+  document.getElementById('mode').textContent = state.mode || 'sin datos';
+  document.getElementById('pnl').textContent = money(state.total_unrealized);
+  document.getElementById('pnl').className = 'value ' + cls(state.total_unrealized);
+  document.getElementById('notional').textContent = money(state.total_notional);
+  document.getElementById('scan').textContent = state.last_scan_text || 'pendiente';
+  document.getElementById('scanCount').textContent = num(state.scan_count);
+  document.getElementById('contracts').textContent = num(state.exchange_symbols_count);
+  document.getElementById('wsMessages').textContent = num(state.browser_websocket_messages);
+  document.getElementById('stateSource').textContent = state.state_source || 'memory';
+  document.getElementById('threadAlive').textContent = state.thread_alive ? 'vivo' : 'muerto';
+  const errorText = state.last_error || state.last_data_warning || state.last_startup_error || '';
   document.getElementById('errorBox').style.display = errorText ? 'block' : 'none';
   document.getElementById('lastError').textContent = errorText;
 
@@ -862,39 +948,91 @@ function renderStatus(data) {
     <tr><td>${t.symbol || ''}</td><td class="positive">${money(t.pnl)}</td><td>${money(t.target)}</td><td>${fixed(t.avg_entry)}</td><td>${fixed(t.close_price)}</td><td>${t.closed_at || ''}</td></tr>
   `), '<tr><td colspan="6">Sin cierres todavía</td></tr>');
   document.getElementById('events').textContent = events.join('\\n');
-  document.getElementById('rawStatus').textContent = JSON.stringify(data, null, 2);
+  document.getElementById('rawStatus').textContent = JSON.stringify(state, null, 2);
 }
+
 function renderClientError(error) {
-  const message = 'Error de la página consultando /api/status: ' + error.message;
+  const message = 'Error del WebSocket/página: ' + error.message;
   document.getElementById('errorBox').style.display = 'block';
   document.getElementById('lastError').textContent = message;
-  document.getElementById('events').textContent = message + '\\n' + document.getElementById('events').textContent;
+  const currentEvents = document.getElementById('events').textContent || '';
+  document.getElementById('events').textContent = message + '\\n' + currentEvents;
 }
-async function refresh() {
-  try {
-    const response = await fetch('/api/status', {cache: 'no-store'});
-    if (!response.ok) {
-      throw new Error('HTTP ' + response.status);
-    }
-    renderStatus(await response.json());
-  } catch (error) {
-    renderClientError(error);
+
+function disconnectPriceSocket() {
+  userClosedSocket = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (priceSocket) {
+    try { priceSocket.close(); } catch (error) {}
+    priceSocket = null;
   }
 }
+
+function scheduleReconnect() {
+  if (userClosedSocket) return;
+  if (reconnectTimer) return;
+  const delay = reconnectDelayMs;
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectPriceWebSocket();
+  }, delay);
+}
+
+function connectPriceWebSocket() {
+  if (priceSocket && (priceSocket.readyState === WebSocket.OPEN || priceSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  userClosedSocket = false;
+  try {
+    priceSocket = new WebSocket(PRICE_WS_URL);
+  } catch (error) {
+    renderClientError(error);
+    scheduleReconnect();
+    return;
+  }
+
+  priceSocket.onopen = () => {
+    reconnectDelayMs = 1000;
+  };
+
+  priceSocket.onmessage = (event) => {
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch (error) {
+      return;
+    }
+    if (applyMiniTickerBatch(payload)) {
+      renderStatus(state);
+    }
+  };
+
+  priceSocket.onerror = () => {
+    renderClientError(new Error('falló la conexión WebSocket con Binance'));
+  };
+
+  priceSocket.onclose = () => {
+    if (!userClosedSocket) {
+      scheduleReconnect();
+    }
+  };
+}
+
 try {
   renderStatus(JSON.parse(document.getElementById('initial-status').textContent || '{}'));
 } catch (error) {
   renderClientError(error);
 }
-refresh();
-setInterval(refresh, 3000);
+connectPriceWebSocket();
+window.addEventListener('beforeunload', disconnectPriceSocket);
 </script>
 </body>
 </html>
 """
-
-
-@app.get("/")
 def index():
     snapshot = bot.snapshot()
     initial_status_json = json.dumps(snapshot, ensure_ascii=False).replace("</", "<\\/")
