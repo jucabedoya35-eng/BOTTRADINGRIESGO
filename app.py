@@ -76,7 +76,7 @@ LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 
 # Cuántos ganadores seguir (top N por cambio 24h)
-TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "30"))
+TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "130"))
 # Cada cuántos segundos refrescar la lista de ganadores por REST
 WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "60"))
 # Cada cuántos segundos corre el scanner de entrada
