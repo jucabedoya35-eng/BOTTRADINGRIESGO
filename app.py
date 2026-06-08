@@ -83,6 +83,9 @@ COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
 # Tiempo de gracia al detener un cache WS antes de arrancar el nuevo (segundos)
 WS_STOP_GRACE        = float(os.getenv("WS_STOP_GRACE", "0.8"))
 
+# Precio máximo permitido para abrir nuevas entradas (bloqueo permanente si supera)
+MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
+
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
@@ -246,6 +249,9 @@ class TradingBot:
         # Cooldown: symbol → timestamp hasta el que está bloqueado
         self.symbol_cooldown: Dict[str, float] = {}
 
+        # Bloqueo permanente por precio: símbolo superó MAX_PRICE_BLOCK en algún momento
+        self.price_blocked: set = set()
+
         # WS caches
         self.price_cache:        Optional[SymbolWebSocketPriceCache] = None
         self.kline_cache:        Optional[KlineWebSocketCache]       = None
@@ -301,6 +307,49 @@ class TradingBot:
             self.last_error = str(exc)
             self.log(f"Bot detenido por error no controlado: {exc}")
 
+    # ── Supervisor ────────────────────────────────────────────────────────────
+
+    async def _supervised(self, coro_factory, name: str, restart_delay: float = 2.0):
+        """
+        Envuelve una corrutina con reinicio automático.
+
+        Si la corrutina termina por cualquier motivo (excepción, CancelledError,
+        o retorno normal) mientras self.running=True, la relanza tras restart_delay
+        segundos. Solo sale definitivamente cuando self.running=False.
+
+        Esto soluciona el caso real del bug:
+          _winners_refresh_loop llama _fetch_top_winners → _update_subscriptions
+          → asyncio.to_thread(_start_kline_cache). Durante ese to_thread, el
+          KlineWebSocketCache viejo cancela y destruye sus tasks. Ese CancelledError
+          puede propagarse hasta _winners_refresh_loop, que entonces retorna.
+          Con gather(return_exceptions=True) la tarea simplemente "termina" y nunca
+          vuelve a correr — hasta que el supervisor la relanza.
+        """
+        while self.running:
+            try:
+                await coro_factory()
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+                self.log(f"[supervisor] {name}: CancelledError inesperado — relanzando en {restart_delay}s...")
+            except Exception as exc:
+                if not self.running:
+                    break
+                self.last_error = str(exc)
+                self.log(f"[supervisor] {name}: excepción '{exc}' — relanzando en {restart_delay}s...")
+            else:
+                # La corrutina retornó normalmente (no lanzó excepción).
+                # Si el bot sigue activo, relancar igual — un loop nunca debe salir solo.
+                if not self.running:
+                    break
+                self.log(f"[supervisor] {name}: retornó inesperadamente — relanzando en {restart_delay}s...")
+
+            try:
+                await asyncio.sleep(restart_delay)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+
     # ── Main ──────────────────────────────────────────────────────────────────
 
     async def _main(self) -> None:
@@ -317,19 +366,16 @@ class TradingBot:
 
         await self._fetch_top_winners()
 
-        # ── CRÍTICO: return_exceptions=True ───────────────────────────────────
-        # Sin esto, si UNA tarea falla/cancela, gather cancela TODAS las demás
-        # (incluyendo _scanner), lo que produce el CancelledError del log.
-        results = await asyncio.gather(
-            self._winners_refresh_loop(),
-            self._scanner(),
-            self._realtime_price_loop(),
-            self._snapshot_loop(),
-            return_exceptions=True,   # <── FIX PRINCIPAL
+        # Cada tarea corre dentro de _supervised. Si muere por cualquier motivo
+        # (CancelledError, excepción, retorno prematuro) mientras running=True,
+        # se relanza automáticamente. El gather solo es para mantener _main vivo.
+        await asyncio.gather(
+            self._supervised(self._winners_refresh_loop, "_winners_refresh_loop"),
+            self._supervised(self._scanner,              "_scanner"),
+            self._supervised(self._realtime_price_loop,  "_realtime_price_loop"),
+            self._supervised(self._snapshot_loop,        "_snapshot_loop"),
+            return_exceptions=True,
         )
-        for i, res in enumerate(results):
-            if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
-                self.log(f"Tarea gather[{i}] terminó con error: {res}")
 
     # ── Gestión de WS caches ──────────────────────────────────────────────────
 
@@ -489,19 +535,12 @@ class TradingBot:
 
     async def _winners_refresh_loop(self) -> None:
         """Refresca la lista de ganadores cada WINNERS_REFRESH_SECS.
-        Captura todas las excepciones para no romper asyncio.gather."""
+        El supervisor (_supervised) se encarga de relanzarla si muere."""
         while self.running:
-            try:
-                await asyncio.sleep(WINNERS_REFRESH_SECS)
-                if not self.running:
-                    break
-                await self._fetch_top_winners()
-            except asyncio.CancelledError:
+            await asyncio.sleep(WINNERS_REFRESH_SECS)
+            if not self.running:
                 break
-            except Exception as exc:
-                self.last_error = str(exc)
-                self.log(f"_winners_refresh_loop error: {exc}")
-                await asyncio.sleep(5)
+            await self._fetch_top_winners()
 
     # ── Condición kline ───────────────────────────────────────────────────────
 
@@ -572,6 +611,11 @@ class TradingBot:
                     price  = all_prices.get(symbol) or row.get("price", 0.0)
                     if price <= 0:
                         continue
+
+                    # Saltar símbolos bloqueados permanentemente por precio alto
+                    with self.lock:
+                        if symbol in self.price_blocked:
+                            continue
 
                     kline_ok = self._kline_entry_ok(symbol)
 
@@ -676,6 +720,16 @@ class TradingBot:
     async def _ensure_short(self, symbol: str, level: float, notional: float,
                              price: float, change: float) -> None:
         with self.lock:
+            # Bloqueo permanente por precio alto (> MAX_PRICE_BLOCK)
+            if price > MAX_PRICE_BLOCK:
+                if symbol not in self.price_blocked:
+                    self.price_blocked.add(symbol)
+                    self.log(
+                        f"BLOQUEADO permanente {symbol}: precio {price:.4f} > "
+                        f"{MAX_PRICE_BLOCK} USD (no se abrirán más entradas)"
+                    )
+                return
+
             # Cooldown: no abrir si el símbolo fue cerrado recientemente
             if self._cooldown_remaining(symbol) > 0:
                 return
@@ -774,6 +828,7 @@ class TradingBot:
             closed        = list(self.closed_trades[:30])
             events        = list(self.events[:50])
             cooldown_snap = dict(self.symbol_cooldown)
+            price_blocked_snap = set(self.price_blocked)
 
         now = time.time()
 
@@ -787,6 +842,7 @@ class TradingBot:
                 "price":              price,
                 "cooldown_remaining": remaining,
                 "cooldown_str":       self._fmt_cooldown(remaining) if remaining > 0 else "",
+                "price_blocked":      sym in price_blocked_snap,
             })
 
         open_positions = []
@@ -859,6 +915,9 @@ class TradingBot:
             "cooldown_count":    len(active_cooldowns),
             "cooldowns":         active_cooldowns,
             "cooldown_hours":    COOLDOWN_SECONDS / 3600,
+            "price_blocked":     sorted(price_blocked_snap),
+            "price_blocked_count": len(price_blocked_snap),
+            "max_price_block":   MAX_PRICE_BLOCK,
             "price_ws": {
                 "active": ws_stats.get("active_symbols", 0),
                 "total":  ws_stats.get("total_symbols",  0),
@@ -1166,6 +1225,7 @@ function render(d) {
   q('contracts').textContent   = n(d.exchange_symbols);
   q('subCount').textContent    = n(d.subscribed_count);
   q('cooldownCount').textContent = n(d.cooldown_count);
+  if (q('priceBlockedCount')) q('priceBlockedCount').textContent = n(d.price_blocked_count);
 
   const pw = d.price_ws || {}, kw = d.kline_ws || {};
   q('wsActive').textContent  = n(pw.active);
@@ -1241,6 +1301,8 @@ function render(d) {
     let statusHtml;
     if (inCooldown) {
       statusHtml = `<span id="cd_${w.symbol}" class="cd-badge">🔒 ${fmtCd(cdSecs)}</span>`;
+    } else if (w.price_blocked) {
+      statusHtml = `<span id="cd_${w.symbol}" style="color:var(--red)">⛔ precio alto</span>`;
     } else if (canTrade) {
       statusHtml = `<span id="cd_${w.symbol}" style="color:var(--green)">✓ libre</span>`;
     } else {
